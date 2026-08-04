@@ -1,0 +1,16 @@
+# collaboration data / large artifacts - never committed
+*.hdf5
+*.tar.gz
+pt/
+plots/
+recluster_cache/
+prevm/
+
+# NERSC-only notebook (20 MB, needs collaboration modules)
+event_display_compare.ipynb
+
+# caches
+__pycache__/
+*.pyc
+*.npz
+*.pkl
