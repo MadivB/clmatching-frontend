@@ -33,7 +33,7 @@ __all__ = ["cluster_summary", "pair_features", "LinkModel"]
 SUB = 300          # per-cluster hit subsample used at fit time (rng(0))
 
 
-def cluster_summary(idx, xyz, e, is_track, rng=None):
+def cluster_summary(idx, xyz, e, is_track, tpc=None, rng=None):
     """Per-cluster geometry summary matching the calibration harvest."""
     rng = rng or np.random.default_rng(0)
     pts = xyz[idx]
@@ -46,8 +46,12 @@ def cluster_summary(idx, xyz, e, is_track, rng=None):
     except np.linalg.LinAlgError:
         lin, udir = 0.0, np.array([1.0, 0.0, 0.0])
     s = idx if len(idx) <= SUB else rng.choice(idx, SUB, replace=False)
-    return dict(cent=c, dir=udir, lin=lin, n=len(idx),
-                e=float(e[idx].sum()), sub=xyz[s], track=bool(is_track))
+    out = dict(cent=c, dir=udir, lin=lin, n=len(idx),
+               e=float(e[idx].sum()), sub=xyz[s], track=bool(is_track))
+    if tpc is not None:
+        out['tpc'] = int(np.bincount(tpc[idx]).argmax())
+        out['ntpc'] = int(len(np.unique(tpc[idx])))
+    return out
 
 
 def pair_features(A, B):
@@ -67,6 +71,58 @@ def pair_features(A, B):
         float(A['track'] and B['track']),
         float(np.linalg.norm(A['cent'] - B['cent'])),
     ])
+
+
+def pair_features_v1(A, B):
+    """v1 features = v0 + pointing + TPC topology (triangles added by
+    score_event_v1, which needs the whole event's candidate graph)."""
+    base = pair_features(A, B)
+    dAB = B['cent'] - A['cent']
+    nAB = float(np.linalg.norm(dAB))
+
+    def point(P, Q):
+        v_ = Q['cent'] - P['cent']
+        pr = float(v_ @ P['dir'])
+        return (float(np.linalg.norm(v_ - pr * P['dir'])),
+                abs(pr) / max(nAB, 1e-9))
+
+    doca_ab, fwd_ab = point(A, B)
+    doca_ba, fwd_ba = point(B, A)
+    return np.concatenate([base, [
+        min(doca_ab, doca_ba), max(doca_ab, doca_ba),
+        max(fwd_ab, fwd_ba),
+        float(A.get('tpc', -1) != B.get('tpc', -2)),
+        max(A.get('ntpc', 1), B.get('ntpc', 1)),
+    ]])
+
+
+def score_event_v1(infos, pairs, model_v0, model_v1):
+    """Two-pass event scoring. `infos` maps label -> cluster_summary (with
+    tpc); `pairs` is a list of (a, b). Pass 1: v0 scores build the candidate
+    graph; pass 2: triangle support (incl. cross-TPC witnesses) completes
+    the v1 features. Returns {(a, b): J1}."""
+    f0 = np.array([pair_features(infos[a], infos[b]) for a, b in pairs])
+    j0 = model_v0.score_pairs(f0)
+    nbr = {}
+    for (a, b), j in zip(pairs, j0):
+        nbr.setdefault(a, {})[b] = float(j)
+        nbr.setdefault(b, {})[a] = float(j)
+    rows = []
+    for (a, b) in pairs:
+        A, B = infos[a], infos[b]
+        na, nb_ = nbr[a], nbr[b]
+        common = set(na) & set(nb_) - {a, b}
+        tri = [min(na[c], nb_[c]) for c in common]
+        cross = [min(na[c], nb_[c]) for c in common
+                 if infos[c].get('tpc') not in (A.get('tpc'), B.get('tpc'))]
+        v1 = pair_features_v1(A, B)
+        rows.append(np.concatenate([v1, [
+            max(tri) if tri else 0.0,
+            np.log1p(sum(1 for t in tri if t >= 0.9)),
+            max(cross) if cross else 0.0,
+        ]]))
+    j1 = model_v1.score_pairs(np.array(rows))
+    return {pr: float(j) for pr, j in zip(pairs, j1)}
 
 
 class LinkModel:
